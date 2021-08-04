@@ -16,6 +16,7 @@ class Receiver:
 
         self.seqNo = START_SEQUENCE_NO
         self.ackNo = 0
+        self.receivePackets = []
 
     def setup_connection(self):
         try:
@@ -30,11 +31,6 @@ class Receiver:
             print(f'Error binding to port - {self.receiverPort}')
             sys.exit()
 
-    def listen(self):
-        while 1:
-            msg, serverAddress = self.receiverSocket.recvfrom(64000)
-            print(f'Received data: {msg.decode()}')
-
     def handshake(self):
         # Get the initial response
         senderMessage, senderAddress = self.receiverSocket.recvfrom(MAX_PACKET_SIZE)
@@ -43,8 +39,10 @@ class Receiver:
 
         # Respond with a SYN_ACK
         if parsedMessage['syn'] == 1:
-            packet = create_packet(seq_no=self.seqNo, ack=1, ack_no=parsedMessage['seq_no']+1, syn=1)
+            packet = create_packet(seq_no=self.seqNo, ack=1, ack_no=get_seq_no(parsedMessage)+1, syn=1)
             self.receiverSocket.sendto(json.dumps(packet).encode(), senderAddress)
+            self.seqNo += 1
+            self.ackNo = get_ack_no(packet)
         else:
             print('Receiver handshaking failed')
 
@@ -52,11 +50,33 @@ class Receiver:
         packet, responseAddress = self.receiverSocket.recvfrom(MAX_PACKET_SIZE)
         parsedResponse = json.loads(packet.decode())
         print(f'Got ifinally from sender: {parsedResponse}')
-        if parsedResponse['ack'] == 1:
+        if is_ack(parsedResponse) == 1:
             print('Handshake Complete!')
+            self.ackNo = get_seq_no(parsedResponse) + 1
         else:
             print('Handshake Failed!')
             sys.exit()
+
+    def listen(self):
+        while 1:
+            msg, senderAddress = self.receiverSocket.recvfrom(MAX_PACKET_SIZE)
+            parsedMsg = json.loads(msg.decode())
+            if (is_fin(parsedMsg)):
+                print('Received FIN, starting teardown.....')
+
+                # Send ACK
+                ackPacket = create_packet(ack=1, ack_no=get_seq_no(parsedMsg) + 1)
+                self.receiverSocket.sendto(json.dumps(ackPacket).encode(), senderAddress)
+
+                # Send FIN
+                finPacket = create_packet(fin=1, seq_no=self.seqNo)
+                self.receiverSocket.sendto(json.dumps(finPacket).encode(), senderAddress)
+                self.receiverSocket.close()
+                print('Socket Closed')
+                break
+
+            else:
+                print(f'Received data: {msg.decode()}')
 
 def check_args(args):
     if len(args) != 3:
@@ -72,6 +92,9 @@ if __name__ == '__main__':
 
         # Perform handshake
         receiver.handshake()
+
+        # Listen on port
+        receiver.listen()
 
     else:
         print('Receiver Arguments not Valid')
