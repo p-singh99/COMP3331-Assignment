@@ -5,6 +5,7 @@ import random
 from socket import *
 sys.path.append('../common')
 from PTPPacket import *
+from logger import *
 import json
 import threading
 import time
@@ -34,6 +35,7 @@ class Sender:
         self.seed = int(argv[8])
         self.senderSocket = None
 
+        self.logger = Logger("Sender_log.txt")
         self.state = STATE_STARTING
         self.fileStat = 0
         self.seqNo = START_SEQUENCE_NO
@@ -42,7 +44,12 @@ class Sender:
         self.latestAckedByte = 0
         self.handShakeSeqNo = 0
         self.windowBase = self.seqNo
+        self.segmentsCount = 0
+        self.retransmissions = 0
+        self.packetsDropped = 0
+        self.duplicateAcks = 0
         self.fileRead = []
+        self.startTime = 0
         self.timerStarted = False
         self.timerStartTime = 0
         self.timerStopTime = 0
@@ -60,19 +67,33 @@ class Sender:
 
     def handshake(self):
         if self.state == STATE_STARTING:
+
+            self.startTime = time.time()
+
             # Send the initial SYN packet
             synSegment = create_packet(syn=1, seq_no=self.seqNo);
             self.senderSocket.sendto(json.dumps(synSegment).encode(), (self.recvHost, self.recvPort))
+            currTime = time.time()
+            logTime = (currTime - self.startTime) * 1000
+            self.logger.create_log_entry("snd", logTime, 'S', get_seq_no(synSegment), len(get_data(synSegment)), 0)
 
             # Get response from receiver
             msg, receiverAddress = self.senderSocket.recvfrom(MAX_PACKET_SIZE)
             parsedResponse = json.loads(msg.decode())
+            currTime = time.time()
+            logTime = (currTime - self.startTime) * 1000
+            self.logger.create_log_entry("rcv", logTime, 'SA', get_seq_no(parsedResponse), len(get_data(parsedResponse)), get_ack_no(parsedResponse))
+
             print(f'Got from receiver: {parsedResponse}')
 
             # Final Acknowledgement
             if parsedResponse['syn'] == 1 and parsedResponse['ack'] == 1:
                 ackSegment = create_packet(seq_no=self.seqNo+1, ack=1, ack_no=get_seq_no(parsedResponse)+1)
                 self.senderSocket.sendto(json.dumps(ackSegment).encode(), (self.recvHost, self.recvPort))
+                currTime = time.time()
+                logTime = (currTime - self.startTime) * 1000
+                self.logger.create_log_entry('snd', logTime, 'A', get_seq_no(ackSegment), len(get_data(ackSegment)), get_ack_no(ackSegment))
+
             else:
                 print("Handshake failed!!")
                 self.senderSocket.close()
@@ -129,7 +150,16 @@ class Sender:
         print(f'Data: {self.fileRead[segmentNo]}')
         print('------------------------------------')
         if segmentNo < len(self.fileRead):
-            self.PLModule(json.dumps(self.fileRead[segmentNo]).encode())
+            PLResult = self.PLModule(json.dumps(self.fileRead[segmentNo]).encode())
+            currTime = time.time()
+            logTime = (currTime - self.startTime) * 1000
+            if PLResult:
+                self.logger.create_log_entry('snd', logTime, 'D', get_seq_no(self.fileRead[segmentNo]), len(get_data(self.fileRead[segmentNo])), get_ack_no(self.fileRead[segmentNo]))
+                self.retransmissions+=1
+            else:
+               self.logger.create_log_entry('drop', logTime, 'D', get_seq_no(self.fileRead[segmentNo]), len(get_data(self.fileRead[segmentNo])), get_ack_no(self.fileRead[segmentNo]))
+               self.packetsDropped+=1
+
             threading.Thread(target=self.timer_thread).start()
 
     def timer_thread(self):
@@ -144,7 +174,7 @@ class Sender:
                     self.timerStarted = False
                     self.handle_timeout()
                 LOCK.notify()
-            time.sleep(1)
+            time.sleep(0.1)
 
     def sender_thread(self):
         global LOCK
@@ -155,12 +185,19 @@ class Sender:
          #   print('Got inside the while loop')
             with LOCK:
                 while (self.seqNo - self.windowBase) <= self.MWS and i < len(self.fileRead):
-            #      print('Got inside the second while loop')
                     if (self.seqNo + len(self.fileRead[i]['message']) - self.windowBase) > self.MWS:
-            #         print(f'SeqNo: {self.seqNo}, fileRead len: {len(get_data(self.fileRead[i]))}')
                         break
-                #    print('Inside thread')
                     PLResult = self.PLModule(json.dumps(self.fileRead[i]).encode())
+                    self.segmentsCount+=1
+                    currTime = time.time()
+                    logTime = (currTime - self.startTime) * 1000
+                    
+                    if PLResult:
+                        self.logger.create_log_entry('snd', logTime, 'D', get_seq_no(self.fileRead[i]), len(get_data(self.fileRead[i])), get_ack_no(self.fileRead[i]))
+                    else:
+                       self.logger.create_log_entry('drop', logTime, 'D', get_seq_no(self.fileRead[i]), len(get_data(self.fileRead[i])), get_ack_no(self.fileRead[i]))
+                       self.packetsDropped+=1
+                    
                     if self.timerStarted == False:
                         self.timerStarted = True
                         self.timerStartTime = time.time()
@@ -175,7 +212,7 @@ class Sender:
                     break
             
                 LOCK.notify()
-            time.sleep(1)
+            time.sleep(0.1)
                         
     def receiver_thread(self):
         global LOCK
@@ -199,6 +236,9 @@ class Sender:
         
                         # Cumulative Ack
                         if get_ack_no(parsedResponse) > self.windowBase:
+                            currTime = time.time()
+                            logTime = (currTime - self.startTime) * 1000
+                            self.logger.create_log_entry('rcv', logTime, 'A', get_seq_no(parsedResponse), len(get_data(parsedResponse)), get_ack_no(parsedResponse))
                             self.windowBase = get_ack_no(parsedResponse)
                             dupAckCount = 1
         
@@ -211,13 +251,16 @@ class Sender:
                                 
                         else:
                             dupAckCount+=1
+                            self.duplicateAcks+=1
                             if dupAckCount == 3:
                                 dupAckCount = 0
-                                
                                 # Find out which segment to send.
                                 segmentNo = int((self.latestAckedByte - self.handShakeSeqNo) / self.MSS)
                                 self.PLModule(json.dumps(self.fileRead[segmentNo]).encode())
-                                
+                                currTime = time.time()
+                                logTime = (currTime - self.startTime) * 1000
+                                self.logger.create_log_entry('rcv', logTime, 'A', get_seq_no(self.fileRead[segmentNo]), len(get_data(self.fileRead[segmentNo]), get_ack_no(self.fileRead[segmentNo])))
+
                                 if self.timerStarted == False:
                                     self.timerStarted = True
                                     self.timerStartTime = time.time()
@@ -229,7 +272,7 @@ class Sender:
                     LOCK.notify()
                 except Exception as e:
                     print(e)
-            time.sleep(1)
+            time.sleep(0.5)
 
     def send_data(self):
 
@@ -272,6 +315,8 @@ class Sender:
                 self.senderSocket.sendto(json.dumps(ackSegment).encode(), (self.recvHost, self.recvPort))
                 self.state = STATE_CLOSE
                 self.senderSocket.close()
+                self.logger.print_sender_details(self.fileStat.st_size, self.segmentsCount, self.packetsDropped, self.retransmissions, self.duplicateAcks)
+                self.logger.close_file()
                 break                
             else:
                 print('Error terminating')
