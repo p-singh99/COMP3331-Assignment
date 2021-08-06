@@ -124,6 +124,10 @@ class Sender:
     def handle_timeout(self): 
         # Find out which segment to send.
         segmentNo = int((self.latestAckedByte - self.handShakeSeqNo) / self.MSS)
+        print(f'The value of segNo is: {segmentNo}')
+        print('-----------------------------------')
+        print(f'Data: {self.fileRead[segmentNo]}')
+        print('------------------------------------')
         if segmentNo < len(self.fileRead):
             self.PLModule(json.dumps(self.fileRead[segmentNo]).encode())
             threading.Thread(target=self.timer_thread).start()
@@ -134,6 +138,7 @@ class Sender:
         while self.timerStarted == True:
             with LOCK:
                 currTime = time.time()
+                print(f'TimerStarted: {self.timerStarted}, currTime: {currTime - self.timerStartTime}')
                 if (currTime - self.timerStartTime >= (self.timeout / 1000)):
                     print('Timeout happened')
                     self.timerStarted = False
@@ -142,36 +147,35 @@ class Sender:
             time.sleep(1)
 
     def sender_thread(self):
-        #global LOCK
+        global LOCK
         
         #print(f'Value: {self.seqNo}')
         i = 0
         while True:
          #   print('Got inside the while loop')
-            #with LOCK:
-            while (self.seqNo - self.windowBase) <= self.MWS and i < len(self.fileRead):
-          #      print('Got inside the second while loop')
-                if (self.seqNo + len(self.fileRead[i]['message']) - self.windowBase) > self.MWS:
-           #         print(f'SeqNo: {self.seqNo}, fileRead len: {len(get_data(self.fileRead[i]))}')
-                    break
-            #    print('Inside thread')
-                PLResult = self.PLModule(json.dumps(self.fileRead[i]).encode())
-                if self.timerStarted == False:
-                    self.timerStarted = True
-                    self.timerStartTime = time.time()
-                    timerThread = threading.Thread(target=self.timer_thread)
-                    timerThread.daemon = True
-                    timerThread.start()
+            with LOCK:
+                while (self.seqNo - self.windowBase) <= self.MWS and i < len(self.fileRead):
+            #      print('Got inside the second while loop')
+                    if (self.seqNo + len(self.fileRead[i]['message']) - self.windowBase) > self.MWS:
+            #         print(f'SeqNo: {self.seqNo}, fileRead len: {len(get_data(self.fileRead[i]))}')
+                        break
+                #    print('Inside thread')
+                    PLResult = self.PLModule(json.dumps(self.fileRead[i]).encode())
+                    if self.timerStarted == False:
+                        self.timerStarted = True
+                        self.timerStartTime = time.time()
+                        timerThread = threading.Thread(target=self.timer_thread)
+                        timerThread.daemon = True
+                        timerThread.start()
 
-                self.seqNo += len(self.fileRead[i]['message'])
-                i+=1
+                    self.seqNo += len(self.fileRead[i]['message'])
+                    i+=1
+                
+                if self.finishedReceiving == True:
+                    break
             
-            if self.finishedReceiving == True:
-                break
-            
-               # LOCK.notify()
-            #time.sleep(1)
-        #print('Exiting thread')
+                LOCK.notify()
+            time.sleep(1)
                         
     def receiver_thread(self):
         global LOCK
@@ -237,18 +241,18 @@ class Sender:
 
 
         # Start Sending thread
-        # senderThread = threading.Thread(target=self.sender_thread)
-        # senderThread.daemon = True
-        # senderThread.start()
+        senderThread = threading.Thread(target=self.sender_thread)
+        senderThread.daemon = True
+        senderThread.start()
         
         # Start the Receiver Thread
         receiverThread = threading.Thread(target=self.receiver_thread)
         receiverThread.daemon = True
         receiverThread.start()
         
-        self.sender_thread()        
-        # senderThread.join()
-        # receiverThread.join()
+        # self.sender_thread()        
+        senderThread.join()
+        receiverThread.join()
 
     def terminate_connection(self):
         # Send the initial FIN packet
@@ -291,7 +295,7 @@ if __name__ == "__main__":
         sender.send_data()
 
         # Terminate connection
-        #sender.terminate_connection()
+        sender.terminate_connection()
 
     else:
         print('Arguments not Valid');
