@@ -27,3 +27,6 @@ def get_ack_no(packet):
 
 def get_seq_no(packet):
     return packet['seq_no']
+    
+def get_data(packet):
+    return packet['message']

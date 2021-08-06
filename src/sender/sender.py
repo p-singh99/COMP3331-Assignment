@@ -30,12 +30,14 @@ class Sender:
         self.MWS = int(argv[4])
         self.MSS = int(argv[5])
         self.timeout = int(argv[6])
-        self.pDrop = int(argv[7])
+        self.pDrop = float(argv[7])
         self.seed = int(argv[8])
         self.senderSocket = None
 
         self.state = STATE_STARTING
-        self.seqNo, self.latestPacketAcked = START_SEQUENCE_NO
+        self.fileStat = 0
+        self.seqNo = START_SEQUENCE_NO
+        self.latestPacketAcked = START_SEQUENCE_NO
         self.ackNo = 0
         self.latestAckedByte = 0
         self.handShakeSeqNo = 0
@@ -46,6 +48,7 @@ class Sender:
         self.timerStopTime = 0
         self.sentPackets = []
         self.receivedPackets = []
+        self.finishedReceiving = False
 
     def setup_connection(self):
         if self.state == STATE_STARTING:
@@ -75,18 +78,21 @@ class Sender:
                 self.senderSocket.close()
                 sys.exit()
             
-            self.seqNo, self.latestPacketAcked = get_seq_no(ackSegment)
+            self.seqNo = get_seq_no(ackSegment)
+            self.latestPacketAcked = get_seq_no(ackSegment)
             self.ackNo = get_ack_no(ackSegment)
             self.state = STATE_CONNECTED
-            self.windowBase, self.latestAckedByte, self. = self.seqNo
+            self.windowBase = self.seqNo
+            self.latestAckedByte = self.seqNo
 
     def read_file(self):
+        print(f'File is: {self.file}')
         f = open(self.file, 'rb')
-        fileStat = os.stat(self.file)
+        self.fileStat = os.stat(self.file)
         seqNo = self.seqNo
         fileSegment = 0
 
-        while (fileSegment < fileStat.st_size):
+        while (fileSegment < self.fileStat.st_size):
             data = f.read(self.MSS)
             packet = create_packet(seq_no=seqNo, ack_no=self.ackNo, payload=1, message=data.decode())
             self.fileRead.append(packet)
@@ -103,14 +109,14 @@ class Sender:
         f.close()
 
         # Returns bytes read
-        return fileStat.st_size
+        return self.fileStat.st_size
 
     def PLModule(self, packet):
         random.seed(self.seed)
         randNum = random.random()
 
         if (randNum > self.pDrop):
-            self.senderSocket.sendto(packet, (self.recvHost, self.recvHost))
+            self.senderSocket.sendto(packet, (self.recvHost, self.recvPort))
             return 1
         else:
             return 0
@@ -123,62 +129,126 @@ class Sender:
             threading.Thread(target=self.timer_thread).start()
 
     def timer_thread(self):
-        with LOCK:
-            while self.timerStarted == True:
+        global LOCK
+    
+        while self.timerStarted == True:
+            with LOCK:
                 currTime = time.time()
                 if (currTime - self.timerStartTime >= (self.timeout / 1000)):
+                    print('Timeout happened')
                     self.timerStarted = False
                     self.handle_timeout()
+                LOCK.notify()
+            time.sleep(1)
 
     def sender_thread(self):
+        #global LOCK
+        
+        #print(f'Value: {self.seqNo}')
         i = 0
+        while True:
+         #   print('Got inside the while loop')
+            #with LOCK:
+            while (self.seqNo - self.windowBase) <= self.MWS and i < len(self.fileRead):
+          #      print('Got inside the second while loop')
+                if (self.seqNo + len(self.fileRead[i]['message']) - self.windowBase) > self.MWS:
+           #         print(f'SeqNo: {self.seqNo}, fileRead len: {len(get_data(self.fileRead[i]))}')
+                    break
+            #    print('Inside thread')
+                PLResult = self.PLModule(json.dumps(self.fileRead[i]).encode())
+                if self.timerStarted == False:
+                    self.timerStarted = True
+                    self.timerStartTime = time.time()
+                    timerThread = threading.Thread(target=self.timer_thread)
+                    timerThread.daemon = True
+                    timerThread.start()
+
+                self.seqNo += len(self.fileRead[i]['message'])
+                i+=1
+            
+            if self.finishedReceiving == True:
+                break
+            
+               # LOCK.notify()
+            #time.sleep(1)
+        #print('Exiting thread')
+                        
+    def receiver_thread(self):
+        global LOCK
+        global MAX_PACKET_SIZE
+        
+        dupAckCount = 0
         while True:
             with LOCK:
-                while (self.seqNo - self.windowBase) <= self.MWS and i < len(self.fileRead):
-                    if (self.seqNo + len(self.fileRead[i]['message']) - self.windowBase) > self.MWS:
-                        break
-
-                    PLResult = self.PLModule(json.dumps(self.fileRead[i]).encode())
-                    if self.timerStarted == False:
-                        self.timerStarted = True
-                        self.timerStartTime = time.time()
-                        threading.Thread(target=self.timer_thread).start()
-
-                    self.seqNo += len(self.fileRead[i]['message'])
-                    i += 1
+                try:
+                    print('before receive')
+                    try:
+                        msg, receiverAddress = self.senderSocket.recvfrom(MAX_PACKET_SIZE)
+                    except Exception as e:
+                        print(e)
                         
-
-    ''' Start here with fast retransmission '''
-    def receiver_thread(self):
-        i = 0
-        while True:
-            msg, receiverAddress = self.senderSocket.recvfrom(MAX_PACKET_SIZE)
-            parsedResponse = json.loads(msg.decode())
-
-            if is_ack(parsedResponse):
-                self.latestAckedByte = get_ack_no(parsedResponse)
-
-                # Cumulative Ack
-                if get_ack_no(parsedResponse) > self.windowBase:
-                    self.windowBase = get_ack_no(parsedResponse)
-
-                    # If there are still unacknowledged packets
-                    if self.seqNo != self.windowBase:
-                        self.timerStarted = True
-                        self.timerStartTime = time.time()
+                    print('after receive')
+                    parsedResponse = json.loads(msg.decode())
+        
+                    if is_ack(parsedResponse):
+                        self.latestAckedByte = get_ack_no(parsedResponse)
+        
+                        # Cumulative Ack
+                        if get_ack_no(parsedResponse) > self.windowBase:
+                            self.windowBase = get_ack_no(parsedResponse)
+                            dupAckCount = 1
+        
+                            # If there are still unacknowledged packets. Reset Timer.
+                            # The timer thread will be running already.
+                            # We just have to change the timerStartTime
+                            if self.seqNo != self.windowBase:
+                                self.timerStarted = True
+                                self.timerStartTime = time.time()
+                                
+                        else:
+                            dupAckCount+=1
+                            if dupAckCount == 3:
+                                dupAckCount = 0
+                                
+                                # Find out which segment to send.
+                                segmentNo = int((self.latestAckedByte - self.handShakeSeqNo) / self.MSS)
+                                self.PLModule(json.dumps(self.fileRead[segmentNo]).encode())
+                                
+                                if self.timerStarted == False:
+                                    self.timerStarted = True
+                                    self.timerStartTime = time.time()
+                                    
+                    if get_ack_no(parsedResponse) >= self.handShakeSeqNo + self.fileStat.st_size:
+                        self.finishedReceiving = True
+                        break
+                        
+                    LOCK.notify()
+                except Exception as e:
+                    print(e)
+            time.sleep(1)
 
     def send_data(self):
 
-        windowBase, currSegment = self.seqNo
+        self.windowBase = self.seqNo
+        currSegment = self.seqNo
         
         # Read the file and store it each segment in a list
         fileSize = self.read_file()
 
-        # Start Sending thread
-        threading.Thread(target=self.sender_thread).start()
 
+        # Start Sending thread
+        # senderThread = threading.Thread(target=self.sender_thread)
+        # senderThread.daemon = True
+        # senderThread.start()
+        
         # Start the Receiver Thread
-        threading.Thread(target=self.receiver_thread).start()
+        receiverThread = threading.Thread(target=self.receiver_thread)
+        receiverThread.daemon = True
+        receiverThread.start()
+        
+        self.sender_thread()        
+        # senderThread.join()
+        # receiverThread.join()
 
     def terminate_connection(self):
         # Send the initial FIN packet
@@ -221,7 +291,7 @@ if __name__ == "__main__":
         sender.send_data()
 
         # Terminate connection
-        sender.terminate_connection()
+        #sender.terminate_connection()
 
     else:
         print('Arguments not Valid');
