@@ -1,9 +1,13 @@
+import os
 from socket import AF_INET, SOCK_DGRAM
 import sys
+import random
 from socket import *
 sys.path.append('../common')
 from PTPPacket import *
 import json
+import threading
+import time
 
 START_SEQUENCE_NO = 0
 MAX_PACKET_SIZE = 64000
@@ -16,6 +20,7 @@ STATE_STOPPED = 4
 STATE_TERMINATE = 5
 STATE_CLOSE = 6
 
+LOCK = threading.Condition()
 
 class Sender:
     def __init__(self, argv):
@@ -30,8 +35,16 @@ class Sender:
         self.senderSocket = None
 
         self.state = STATE_STARTING
-        self.seqNo = START_SEQUENCE_NO
+        self.seqNo, self.latestPacketAcked = START_SEQUENCE_NO
         self.ackNo = 0
+        self.latestAckedByte = 0
+        self.handShakeSeqNo = 0
+        self.windowBase = self.seqNo
+        self.fileRead = []
+        self.timerStarted = False
+        self.timerStartTime = 0
+        self.timerStopTime = 0
+        self.sentPackets = []
         self.receivedPackets = []
 
     def setup_connection(self):
@@ -62,9 +75,110 @@ class Sender:
                 self.senderSocket.close()
                 sys.exit()
             
-            self.seqNo = get_seq_no(ackSegment)
+            self.seqNo, self.latestPacketAcked = get_seq_no(ackSegment)
             self.ackNo = get_ack_no(ackSegment)
             self.state = STATE_CONNECTED
+            self.windowBase, self.latestAckedByte, self. = self.seqNo
+
+    def read_file(self):
+        f = open(self.file, 'rb')
+        fileStat = os.stat(self.file)
+        seqNo = self.seqNo
+        fileSegment = 0
+
+        while (fileSegment < fileStat.st_size):
+            data = f.read(self.MSS)
+            packet = create_packet(seq_no=seqNo, ack_no=self.ackNo, payload=1, message=data.decode())
+            self.fileRead.append(packet)
+            seqNo += self.MSS
+            fileSegment += self.MSS
+        
+        ''' DELETE THIS LATER '''
+        checkFile = open('result.txt', 'w')
+        for packet in self.fileRead:
+            checkFile.write(json.dumps(packet))
+            checkFile.write('\n')
+        
+        checkFile.close()
+        f.close()
+
+        # Returns bytes read
+        return fileStat.st_size
+
+    def PLModule(self, packet):
+        random.seed(self.seed)
+        randNum = random.random()
+
+        if (randNum > self.pDrop):
+            self.senderSocket.sendto(packet, (self.recvHost, self.recvHost))
+            return 1
+        else:
+            return 0
+
+    def handle_timeout(self): 
+        # Find out which segment to send.
+        segmentNo = int((self.latestAckedByte - self.handShakeSeqNo) / self.MSS)
+        if segmentNo < len(self.fileRead):
+            self.PLModule(json.dumps(self.fileRead[segmentNo]).encode())
+            threading.Thread(target=self.timer_thread).start()
+
+    def timer_thread(self):
+        with LOCK:
+            while self.timerStarted == True:
+                currTime = time.time()
+                if (currTime - self.timerStartTime >= (self.timeout / 1000)):
+                    self.timerStarted = False
+                    self.handle_timeout()
+
+    def sender_thread(self):
+        i = 0
+        while True:
+            with LOCK:
+                while (self.seqNo - self.windowBase) <= self.MWS and i < len(self.fileRead):
+                    if (self.seqNo + len(self.fileRead[i]['message']) - self.windowBase) > self.MWS:
+                        break
+
+                    PLResult = self.PLModule(json.dumps(self.fileRead[i]).encode())
+                    if self.timerStarted == False:
+                        self.timerStarted = True
+                        self.timerStartTime = time.time()
+                        threading.Thread(target=self.timer_thread).start()
+
+                    self.seqNo += len(self.fileRead[i]['message'])
+                    i += 1
+                        
+
+    ''' Start here with fast retransmission '''
+    def receiver_thread(self):
+        i = 0
+        while True:
+            msg, receiverAddress = self.senderSocket.recvfrom(MAX_PACKET_SIZE)
+            parsedResponse = json.loads(msg.decode())
+
+            if is_ack(parsedResponse):
+                self.latestAckedByte = get_ack_no(parsedResponse)
+
+                # Cumulative Ack
+                if get_ack_no(parsedResponse) > self.windowBase:
+                    self.windowBase = get_ack_no(parsedResponse)
+
+                    # If there are still unacknowledged packets
+                    if self.seqNo != self.windowBase:
+                        self.timerStarted = True
+                        self.timerStartTime = time.time()
+
+    def send_data(self):
+
+        windowBase, currSegment = self.seqNo
+        
+        # Read the file and store it each segment in a list
+        fileSize = self.read_file()
+
+        # Start Sending thread
+        threading.Thread(target=self.sender_thread).start()
+
+        # Start the Receiver Thread
+        threading.Thread(target=self.receiver_thread).start()
 
     def terminate_connection(self):
         # Send the initial FIN packet
@@ -104,6 +218,7 @@ if __name__ == "__main__":
         sender.handshake()
 
         # Read and send data
+        sender.send_data()
 
         # Terminate connection
         sender.terminate_connection()
